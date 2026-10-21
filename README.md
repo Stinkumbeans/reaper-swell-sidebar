@@ -27,7 +27,7 @@ Adds a collapsible sidebar to REAPER's stock file dialogs (open, save, browse fo
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/reaper-swell-sidebar.git
+git clone https://github.com/Stinkumbeans/reaper-swell-sidebar.git
 cd reaper-swell-sidebar
 chmod +x install.sh
 ./install.sh
