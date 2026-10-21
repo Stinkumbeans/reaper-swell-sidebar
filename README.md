@@ -21,7 +21,7 @@ This patch affects the dialogs opened by **Insert Media**, **Save Project As**, 
 3. Copy the pre-built binary: `cp releases/libSwell.so ~/opt/REAPER/libSwell.so`
 4. Restart REAPER
 
-> **Note:** The pre-built binary was built on CachyOS (Arch-based, kernel 7.x). It should work on most modern Linux distros, but if REAPER crashes on launch, build from source instead.
+> **Note:** The pre-built binary was built on Fedora with a CachyOS kernel. It should work on most modern Linux distros, but if REAPER crashes on launch, build from source instead.
 
 ---
 
@@ -34,9 +34,9 @@ On Debian/Ubuntu:
 sudo apt install build-essential git libgtk-3-dev
 ```
 
-On Arch/Manjaro/CachyOS:
+On Fedora:
 ```bash
-sudo pacman -S base-devel git gtk3
+sudo dnf install gcc make git gtk3-devel
 ```
 
 **Build and install:**
