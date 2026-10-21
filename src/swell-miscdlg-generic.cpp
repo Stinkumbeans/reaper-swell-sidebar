@@ -614,6 +614,15 @@ static void fc_refresh_sidebar(HWND hwnd)
   browse_populate_places(places);
 }
 
+static void fc_bookmarks_path(char *out, size_t sz)
+{
+  const char *xdg = getenv("XDG_CONFIG_HOME");
+  if (xdg && *xdg) { snprintf(out, sz, "%s/gtk-3.0/bookmarks", xdg); return; }
+  const char *home = getenv("HOME");
+  if (home && *home) snprintf(out, sz, "%s/.config/gtk-3.0/bookmarks", home);
+  else out[0] = 0;
+}
+
 static void fc_url_encode_path(const char *path, char *out, size_t outsz)
 {
   char *e = out, *end = out + outsz - 1;
@@ -631,8 +640,8 @@ static void fc_url_encode_path(const char *path, char *out, size_t outsz)
 static void fc_sidebar_add_bm(HWND hwnd, const char *path, const char *label=NULL)
 {
   if (!path||!*path) return;
-  const char *home=getenv("HOME"); if (!home) return;
-  char bmpath[PATH_MAX]; snprintf(bmpath,sizeof(bmpath),"%s/.config/gtk-3.0/bookmarks",home);
+  char bmpath[PATH_MAX]; fc_bookmarks_path(bmpath, sizeof(bmpath));
+  if (!bmpath[0]) return;
   char enc[PATH_MAX*3]; fc_url_encode_path(path, enc, sizeof(enc));
   char uri[PATH_MAX*3+8]; snprintf(uri,sizeof(uri),"file://%s",enc);
   FILE *f=fopen(bmpath,"r"); bool exists=false;
@@ -651,8 +660,8 @@ static void fc_sidebar_add_bm(HWND hwnd, const char *path, const char *label=NUL
 static void fc_sidebar_remove_bm(HWND hwnd, const char *path)
 {
   if (!path||!*path) return;
-  const char *home=getenv("HOME"); if (!home) return;
-  char bmpath[PATH_MAX]; snprintf(bmpath,sizeof(bmpath),"%s/.config/gtk-3.0/bookmarks",home);
+  char bmpath[PATH_MAX]; fc_bookmarks_path(bmpath, sizeof(bmpath));
+  if (!bmpath[0]) return;
   char enc[PATH_MAX*3]; fc_url_encode_path(path, enc, sizeof(enc));
   char uri[PATH_MAX*3+8]; snprintf(uri,sizeof(uri),"file://%s",enc);
   size_t ulen=strlen(uri);
@@ -1004,10 +1013,9 @@ static void browse_populate_devices(HWND tv)
 
 static void browse_populate_bookmarks(HWND tv)
 {
-  const char *home = getenv("HOME");
-  if (!home || !*home) return;
   char bmpath[PATH_MAX];
-  snprintf(bmpath, sizeof(bmpath), "%s/.config/gtk-3.0/bookmarks", home);
+  fc_bookmarks_path(bmpath, sizeof(bmpath));
+  if (!bmpath[0]) return;
   FILE *f = fopen(bmpath, "r");
   if (!f) return;
 
