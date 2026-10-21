@@ -1,0 +1,1504 @@
+--- /tmp/WDL/WDL/swell/swell-miscdlg-generic.cpp	2026-10-21 14:40:47.118134653 +0100
++++ /home/chimpanda/.local/share/reaper-libswell-patch/swell-miscdlg-generic.cpp	2026-10-21 02:17:27.313986374 +0100
+@@ -36,6 +36,8 @@
+ #include "../ptrlist.h"
+ #include <dirent.h>
+ #include <time.h>
++#include <cctype>
++#include <sys/wait.h>
+ 
+ #include "../lineparse.h"
+ #define WDL_HASSTRINGS_EXPORT static
+@@ -130,9 +132,10 @@
+   enum modeEnum { SAVE=0,OPEN, OPENMULTI, OPENDIR };
+ 
+   BrowseFile_State(const char *_cap, const char *_idir, const char *_ifile, const char *_el, modeEnum _mode, char *_fnout, int _fnout_sz) :
+-    caption(_cap), initialdir(_idir), initialfile(_ifile), extlist(_el), mode(_mode), 
++    caption(_cap), initialdir(_idir), initialfile(_ifile), extlist(_el), mode(_mode),
+     sortcol(0), sortrev(0),
+-    fnout(_fnout), fnout_sz(_fnout_sz), viewlist_store(16384), viewlist(4096), show_hidden(false)
++    fnout(_fnout), fnout_sz(_fnout_sz), viewlist_store(16384), viewlist(4096), show_hidden(false),
++    places_visible(true), places_width(SWELL_UI_SCALE(140))
+   {
+   }
+   ~BrowseFile_State()
+@@ -215,6 +218,8 @@
+   WDL_PtrList<rec> viewlist;
+ 
+   bool show_hidden;
++  bool places_visible;
++  int  places_width;
+ 
+   void viewlist_sort(const char *filter)
+   {
+@@ -362,9 +367,783 @@
+   }
+ }
+ 
++// ── Sidebar and file-op control IDs ──────────────────────────────────────────
++enum {
++  FC_IDC_DIR           = 0x103,
++  FC_IDC_LIST          = 0x104,
++  FC_IDC_PLACES        = 0x109,
++  FC_IDC_PLACES_TOGGLE = 0x10A,
++  FC_IDC_SB_NEW_GROUP  = 0x10B,
++  FC_IDC_SB_MANAGE     = 0x10C,
++  FC_WM_UPD            = WM_USER + 100,
++  ID_FC_NEWFOLDER      = 0x200,
++  ID_FC_RENAME,
++  ID_FC_TRASH,
++  ID_FC_COPY,
++  ID_FC_CUT,
++  ID_FC_PASTE,
++  ID_FC_COPYPATH,
++  ID_FC_OPENFILEMANAGER,
++  ID_FC_SIDEBAR_ADD,
++  ID_FC_SIDEBAR_REMOVE,
++  ID_FC_GROUP_RENAME      = 0x210,
++  ID_FC_GROUP_DELETE      = 0x211,
++  ID_FC_GROUP_ADD_BASE    = 0x280, // 0x280..0x2FF = "add to section N" (up to 128 sections)
++  ID_FC_GROUP_NEW_SECTION = 0x300,
++  ID_FC_MANAGE_RENAME_BASE = 0x380, // 0x380..0x3BF = rename group N (up to 64 groups)
++  ID_FC_MANAGE_DELETE_BASE = 0x3C0, // 0x3C0..0x3FF = delete group N (up to 64 groups)
++};
++
++// ── lParam sentinel helpers ───────────────────────────────────────────────────
++// lParam == 1  → fixed section header (Places, Devices) — non-navigatable
++// lParam > 1, [0] == '\xFF' → custom group section header (name at lParam+1)
++// lParam > 1, [0] != '\xFF' → navigatable filesystem path
++static inline bool lp_is_group_hdr(LPARAM lp) { return lp > 1 && ((char*)lp)[0] == '\xFF'; }
++static inline bool lp_is_path(LPARAM lp)       { return lp > 1 && ((char*)lp)[0] != '\xFF'; }
++
++// ── Splitter subclass proc ────────────────────────────────────────────────────
++static int s_spl_drag_x0, s_spl_drag_w0;
++
++static LRESULT WINAPI splitter_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
++{
++  WNDPROC orig = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_USERDATA);
++  HWND par = GetParent(hwnd);
++
++  switch (msg)
++  {
++    case WM_SETCURSOR:
++      SetCursor(LoadCursor(NULL, IDC_SIZEWE));
++      return TRUE;
++    case WM_LBUTTONDOWN:
++      {
++        SetCapture(hwnd);
++        POINT pt = { GET_X_LPARAM(lParam), 0 };
++        ClientToScreen(hwnd, &pt);
++        s_spl_drag_x0 = pt.x;
++        BrowseFile_State *parms = par ? (BrowseFile_State *)GetWindowLongPtr(par, GWLP_USERDATA) : NULL;
++        s_spl_drag_w0 = parms ? parms->places_width : SWELL_UI_SCALE(140);
++      }
++      return 0;
++    case WM_MOUSEMOVE:
++      if (GetCapture() == hwnd)
++      {
++        POINT pt = { GET_X_LPARAM(lParam), 0 };
++        ClientToScreen(hwnd, &pt);
++        BrowseFile_State *parms = par ? (BrowseFile_State *)GetWindowLongPtr(par, GWLP_USERDATA) : NULL;
++        if (parms)
++        {
++          int new_w = s_spl_drag_w0 + (pt.x - s_spl_drag_x0);
++          if (new_w < SWELL_UI_SCALE(60))  new_w = SWELL_UI_SCALE(60);
++          if (new_w > SWELL_UI_SCALE(400)) new_w = SWELL_UI_SCALE(400);
++          if (new_w != parms->places_width)
++          {
++            parms->places_width = new_w;
++            parms->places_visible = true;
++            SetWindowText(hwnd, "\xe2\x97\x80"); // ◀
++            SendMessage(par, WM_SIZE, 0, 0);
++          }
++        }
++      }
++      return 0;
++    case WM_LBUTTONUP:
++      {
++        int moved = 0;
++        if (GetCapture() == hwnd)
++        {
++          POINT pt = { GET_X_LPARAM(lParam), 0 };
++          ClientToScreen(hwnd, &pt);
++          moved = abs(pt.x - s_spl_drag_x0);
++          ReleaseCapture();
++        }
++        if (moved < 4) // click without drag: toggle collapse
++          PostMessage(par, WM_COMMAND, MAKEWPARAM(FC_IDC_PLACES_TOGGLE, BN_CLICKED), (LPARAM)hwnd);
++      }
++      return 0;
++  }
++  return orig ? orig(hwnd, msg, wParam, lParam) : DefWindowProc(hwnd, msg, wParam, lParam);
++}
++
++// ── Internal file clipboard ────────────────────────────────────────────────
++struct fc_clip_t {
++  WDL_PtrList<char> paths;
++  bool is_cut;
++  fc_clip_t() : is_cut(false) {}
++  void clear() { paths.Empty(true, free); is_cut = false; }
++};
++static fc_clip_t s_fc_clip;
++
++// ── Input dialog (new folder / rename) ────────────────────────────────────
++struct swellInputState { const char *title, *prompt, *def_text; char result[2048]; };
++
++static LRESULT WINAPI swellInputProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
++{
++  enum { IDC_PROMPT=0x100, IDC_EDIT };
++  switch (uMsg) {
++    case WM_CREATE:
++      if (lParam) {
++        SetWindowLong(hwnd,GWL_WNDPROC,(LPARAM)SwellDialogDefaultWindowProc);
++        SetWindowLong(hwnd,DWL_DLGPROC,(LPARAM)swellInputProc);
++        SetWindowLongPtr(hwnd,GWLP_USERDATA,lParam);
++        swellInputState *st=(swellInputState*)lParam;
++        if (st->title) SetWindowText(hwnd,st->title);
++        SWELL_MakeSetCurParms(1,1,0,0,hwnd,false,false);
++        SWELL_MakeLabel(-1,st->prompt?st->prompt:"",IDC_PROMPT,0,0,10,10,0);
++        SWELL_MakeEditField(IDC_EDIT,0,0,0,0,0);
++        SWELL_MakeButton(1,"OK",IDOK,0,0,0,0,0);
++        SWELL_MakeButton(0,"Cancel",IDCANCEL,0,0,0,0,0);
++        SWELL_MakeSetCurParms(1,1,0,0,NULL,false,false);
++        SetWindowPos(hwnd,NULL,0,0,SWELL_UI_SCALE(300),SWELL_UI_SCALE(110),
++                     SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOMOVE);
++        if (st->def_text) SetDlgItemText(hwnd,IDC_EDIT,st->def_text);
++        SendDlgItemMessage(hwnd,IDC_EDIT,EM_SETSEL,0,-1);
++        SetFocus(GetDlgItem(hwnd,IDC_EDIT));
++      }
++    break;
++    case WM_SIZE: {
++      RECT r; GetClientRect(hwnd,&r);
++      const int sc8=SWELL_UI_SCALE(8), rh=SWELL_UI_SCALE(22), bw=SWELL_UI_SCALE(68);
++      SetWindowPos(GetDlgItem(hwnd,IDC_PROMPT),NULL,sc8,sc8,r.right-sc8*2,rh,SWP_NOACTIVATE|SWP_NOZORDER);
++      SetWindowPos(GetDlgItem(hwnd,IDC_EDIT),NULL,sc8,sc8*2+rh,r.right-sc8*2,rh,SWP_NOACTIVATE|SWP_NOZORDER);
++      int by=r.bottom-sc8-rh;
++      SetWindowPos(GetDlgItem(hwnd,IDOK),NULL,r.right-sc8*2-bw*2,by,bw,rh,SWP_NOACTIVATE|SWP_NOZORDER);
++      SetWindowPos(GetDlgItem(hwnd,IDCANCEL),NULL,r.right-sc8-bw,by,bw,rh,SWP_NOACTIVATE|SWP_NOZORDER);
++    }
++    break;
++    case WM_COMMAND:
++      if (LOWORD(wParam)==IDOK) {
++        swellInputState *st=(swellInputState*)GetWindowLongPtr(hwnd,GWLP_USERDATA);
++        if (st) GetDlgItemText(hwnd,IDC_EDIT,st->result,sizeof(st->result));
++        EndDialog(hwnd,1);
++      } else if (LOWORD(wParam)==IDCANCEL) EndDialog(hwnd,0);
++    return 0;
++    case WM_KEYDOWN:
++      if (wParam==VK_RETURN) { SendMessage(hwnd,WM_COMMAND,IDOK,0); return 1; }
++      if (wParam==VK_ESCAPE) { EndDialog(hwnd,0); return 1; }
++    return 0;
++  }
++  return 0;
++}
++
++// ── File operation helpers ─────────────────────────────────────────────────
++static void fc_makedirs(const char *dir)
++{
++  struct stat st;
++  if (!dir||(stat(dir,&st)==0&&S_ISDIR(st.st_mode))) return;
++  char tmp[PATH_MAX]; lstrcpyn_safe(tmp,dir,sizeof(tmp));
++  for (char *p=tmp+1; *p; p++) { if (*p=='/') { *p=0; mkdir(tmp,0755); *p='/'; } }
++  mkdir(tmp,0755);
++}
++
++static bool fc_trash_file(const char *path)
++{
++  const char *home=getenv("HOME");
++  if (!home||!path||!*path) return false;
++  char tf[PATH_MAX], ti[PATH_MAX];
++  snprintf(tf,sizeof(tf),"%s/.local/share/Trash/files",home);
++  snprintf(ti,sizeof(ti),"%s/.local/share/Trash/info",home);
++  fc_makedirs(tf); fc_makedirs(ti);
++  const char *base=WDL_get_filepart(path);
++  char dest[PATH_MAX]; snprintf(dest,sizeof(dest),"%s/%s",tf,base);
++  if (access(dest,F_OK)==0) {
++    const char *ext=WDL_get_fileext(base);
++    int bl=ext>base?(int)(ext-base):(int)strlen(base);
++    for (int n=1;n<10000;n++) {
++      if (ext&&*ext) snprintf(dest,sizeof(dest),"%s/%.*s.%d%s",tf,bl,base,n,ext);
++      else           snprintf(dest,sizeof(dest),"%s/%s.%d",tf,base,n);
++      if (access(dest,F_OK)!=0) break;
++    }
++  }
++  if (rename(path,dest)!=0) return false;
++  char info[PATH_MAX];
++  snprintf(info,sizeof(info),"%s/%s.trashinfo",ti,WDL_get_filepart(dest));
++  time_t now=time(NULL); struct tm *tm_info=localtime(&now);
++  char ts[32]=""; if (tm_info) strftime(ts,sizeof(ts),"%Y-%m-%dT%H:%M:%S",tm_info);
++  FILE *fi=fopen(info,"w");
++  if (fi) { fprintf(fi,"[Trash Info]\nPath=%s\nDeletionDate=%s\n",path,ts); fclose(fi); }
++  return true;
++}
++
++static bool fc_copy_file(const char *src, const char *dst)
++{
++  FILE *fin=fopen(src,"rb"); if (!fin) return false;
++  FILE *fout=fopen(dst,"wb"); if (!fout) { fclose(fin); return false; }
++  char buf[65536]; size_t n; bool ok=true;
++  while ((n=fread(buf,1,sizeof(buf),fin))>0) if (!fwrite(buf,1,n,fout)){ok=false;break;}
++  fclose(fin); fclose(fout);
++  if (!ok) unlink(dst);
++  return ok;
++}
++
++static void fc_set_system_clip(HWND hwnd, WDL_PtrList<char> &paths, bool is_cut)
++{
++  size_t total=sizeof(DROPFILES)+1;
++  for (int i=0;i<paths.GetSize();i++) total+=strlen(paths.Get(i))+1;
++  HANDLE h=GlobalAlloc(GMEM_MOVEABLE,total);
++  if (!h) return;
++  DROPFILES *df=(DROPFILES*)GlobalLock(h);
++  if (!df) { GlobalFree(h); return; }
++  df->pFiles=sizeof(DROPFILES); df->pt.x=df->pt.y=0; df->fNC=FALSE; df->fWide=FALSE;
++  char *p=(char*)(df+1);
++  for (int i=0;i<paths.GetSize();i++) { const char *s=paths.Get(i); size_t l=strlen(s)+1; memcpy(p,s,l); p+=l; }
++  *p=0; GlobalUnlock(h);
++  OpenClipboard(hwnd); EmptyClipboard(); SetClipboardData(CF_HDROP,h);
++  // x-special/gnome-copied-files for Dolphin cut/copy awareness
++  char gnome[65536];
++  snprintf(gnome,sizeof(gnome),"%s",is_cut?"cut":"copy");
++  for (int i=0;i<paths.GetSize();i++) snprintf_append(gnome,sizeof(gnome),"\nfile://%s",paths.Get(i));
++  snprintf_append(gnome,sizeof(gnome),"\n");
++  UINT gfmt=RegisterClipboardFormat("x-special/gnome-copied-files");
++  if (gfmt) {
++    size_t gsl=strlen(gnome)+1; HANDLE gh=GlobalAlloc(GMEM_MOVEABLE,gsl);
++    if (gh) { char *gp=(char*)GlobalLock(gh); if(gp){memcpy(gp,gnome,gsl);GlobalUnlock(gh);} SetClipboardData(gfmt,gh); }
++  }
++  CloseClipboard();
++}
++
++// forward declarations for sidebar helpers below
++static void browse_tree_free(HWND tv, HTREEITEM item);
++static void browse_populate_places(HWND tv);
++static HTREEITEM browse_tree_insert(HWND tv, HTREEITEM parent, const char *label, const char *path);
++
++static void fc_refresh_sidebar(HWND hwnd)
++{
++  HWND places=GetDlgItem(hwnd,FC_IDC_PLACES);
++  if (!places) return;
++  browse_tree_free(places,TreeView_GetRoot(places));
++  TreeView_DeleteAllItems(places);
++  browse_populate_places(places);
++}
++
++static void fc_url_encode_path(const char *path, char *out, size_t outsz)
++{
++  char *e = out, *end = out + outsz - 1;
++  for (const char *p = path; *p && e < end; p++)
++  {
++    unsigned char c = (unsigned char)*p;
++    if (c == '/' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~')
++      *e++ = c;
++    else if (e + 3 <= end) { sprintf(e, "%%%02X", c); e += 3; }
++  }
++  *e = 0;
++}
++
++static void fc_sidebar_add_bm(HWND hwnd, const char *path, const char *label=NULL)
++{
++  if (!path||!*path) return;
++  const char *home=getenv("HOME"); if (!home) return;
++  char bmpath[PATH_MAX]; snprintf(bmpath,sizeof(bmpath),"%s/.config/gtk-3.0/bookmarks",home);
++  char enc[PATH_MAX*3]; fc_url_encode_path(path, enc, sizeof(enc));
++  char uri[PATH_MAX*3+8]; snprintf(uri,sizeof(uri),"file://%s",enc);
++  FILE *f=fopen(bmpath,"r"); bool exists=false;
++  if (f) {
++    char line[PATH_MAX*3+64];
++    while (fgets(line,sizeof(line),f))
++      if (strncmp(line,uri,strlen(uri))==0) { exists=true; break; }
++    fclose(f);
++  }
++  if (exists) return;
++  f=fopen(bmpath,"a");
++  if (f) { fprintf(f,"%s %s\n",uri,label&&*label?label:WDL_get_filepart(path)); fclose(f); }
++  fc_refresh_sidebar(hwnd);
++}
++
++static void fc_sidebar_remove_bm(HWND hwnd, const char *path)
++{
++  if (!path||!*path) return;
++  const char *home=getenv("HOME"); if (!home) return;
++  char bmpath[PATH_MAX]; snprintf(bmpath,sizeof(bmpath),"%s/.config/gtk-3.0/bookmarks",home);
++  char enc[PATH_MAX*3]; fc_url_encode_path(path, enc, sizeof(enc));
++  char uri[PATH_MAX*3+8]; snprintf(uri,sizeof(uri),"file://%s",enc);
++  size_t ulen=strlen(uri);
++  WDL_PtrList<char> lines; FILE *f=fopen(bmpath,"r"); bool found=false;
++  if (f) {
++    char line[PATH_MAX];
++    while (fgets(line,sizeof(line),f)) {
++      size_t l=strlen(line); while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r')) line[--l]=0;
++      if (strncmp(line,uri,ulen)==0&&(line[ulen]==0||line[ulen]==' ')) found=true;
++      else lines.Add(strdup(line));
++    }
++    fclose(f);
++  }
++  if (found) {
++    f=fopen(bmpath,"w");
++    if (f) { for (int i=0;i<lines.GetSize();i++) fprintf(f,"%s\n",lines.Get(i)); fclose(f); }
++    fc_refresh_sidebar(hwnd);
++  }
++  lines.Empty(true,free);
++}
++
++// ── Named bookmark groups ─────────────────────────────────────────────────────
++
++static void fc_groups_path(char *out, size_t sz)
++{
++  const char *h = getenv("HOME");
++  if (h) snprintf(out, sz, "%s/.config/reaper-swell-groups", h);
++  else out[0] = 0;
++}
++
++static void fc_groups_get_sections(WDL_PtrList<char> &out)
++{
++  char gp[PATH_MAX]; fc_groups_path(gp, sizeof(gp));
++  FILE *f = fopen(gp, "r"); if (!f) return;
++  char line[512];
++  while (fgets(line, sizeof(line), f)) {
++    if (line[0] != '[') continue;
++    char *e = strchr(line+1, ']'); if (!e) continue; *e = 0;
++    out.Add(strdup(line+1));
++  }
++  fclose(f);
++}
++
++static void browse_populate_groups(HWND tv)
++{
++  char gp[PATH_MAX]; fc_groups_path(gp, sizeof(gp));
++  FILE *f = fopen(gp, "r"); if (!f) return;
++  HTREEITEM cur_hdr = NULL;
++  char line[PATH_MAX*3 + 256];
++  while (fgets(line, sizeof(line), f)) {
++    size_t l = strlen(line);
++    while (l > 0 && (line[l-1]=='\n'||line[l-1]=='\r')) line[--l] = 0;
++    if (!line[0] || line[0] == '#') continue;
++    if (line[0] == '[') {
++      char *e = strchr(line+1, ']'); if (!e) continue; *e = 0;
++      const char *name = line+1;
++      TV_INSERTSTRUCT tis; memset(&tis, 0, sizeof(tis));
++      tis.hParent = TVI_ROOT; tis.hInsertAfter = TVI_LAST;
++      tis.item.mask = TVIF_TEXT|TVIF_PARAM|TVIF_CHILDREN;
++      tis.item.pszText = (char*)name;
++      char *lp = (char*)malloc(strlen(name)+2);
++      lp[0] = '\xFF'; strcpy(lp+1, name);
++      tis.item.lParam = (LPARAM)lp;
++      tis.item.cChildren = 1;
++      cur_hdr = TreeView_InsertItem(tv, &tis);
++      if (cur_hdr) TreeView_Expand(tv, cur_hdr, TVE_EXPAND);
++    } else if (strncmp(line, "file://", 7) == 0 && cur_hdr) {
++      char *p = line+7, *end = p;
++      while (*end && *end != ' ' && *end != '\t') end++;
++      char *lbl = *end ? end+1 : NULL;
++      *end = 0;
++      if (lbl) { char *le=lbl; while(*le&&*le!='\n'&&*le!='\r') le++; *le=0; }
++      char dec[PATH_MAX]; char *r=p, *w=dec;
++      while (*r && w < dec+sizeof(dec)-1) {
++        if (*r=='%'&&isxdigit((unsigned char)r[1])&&isxdigit((unsigned char)r[2])) {
++          char hex[3]={r[1],r[2],0}; *w++=(char)strtol(hex,NULL,16); r+=3;
++        } else *w++=*r++;
++      }
++      *w = 0;
++      const char *label = (lbl&&*lbl) ? lbl : WDL_get_filepart(dec);
++      browse_tree_insert(tv, cur_hdr, label, dec);
++    }
++  }
++  fclose(f);
++}
++
++static void fc_group_add(HWND hwnd, const char *section, const char *path, const char *label)
++{
++  if (!section||!*section||!path||!*path) return;
++  char gp[PATH_MAX]; fc_groups_path(gp, sizeof(gp));
++  char enc[PATH_MAX*3]; fc_url_encode_path(path, enc, sizeof(enc));
++  char uri[PATH_MAX*3+8]; snprintf(uri, sizeof(uri), "file://%s", enc);
++  const char *lbl = (label&&*label) ? label : WDL_get_filepart(path);
++  WDL_PtrList<char> lines;
++  FILE *f = fopen(gp, "r");
++  if (f) {
++    char line[PATH_MAX*3+256];
++    while (fgets(line, sizeof(line), f)) {
++      size_t l=strlen(line); while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r')) line[--l]=0;
++      lines.Add(strdup(line));
++    }
++    fclose(f);
++  }
++  f = fopen(gp, "w"); if (!f) { lines.Empty(true,free); return; }
++  bool section_found=false, added=false, in_sec=false;
++  for (int i=0; i<lines.GetSize(); i++) {
++    const char *l = lines.Get(i);
++    if (l[0]=='[') {
++      char *dup=strdup(l+1); char *e=strchr(dup,']'); if(e)*e=0;
++      bool this_sec = !strcmp(dup, section);
++      free(dup);
++      if (in_sec && !added) { fprintf(f,"%s %s\n",uri,lbl); added=true; }
++      if (this_sec) { section_found=true; in_sec=true; } else in_sec=false;
++    }
++    fprintf(f,"%s\n",l);
++  }
++  if (!added) {
++    if (!section_found) fprintf(f,"\n[%s]\n",section);
++    fprintf(f,"%s %s\n",uri,lbl);
++  }
++  fclose(f); lines.Empty(true,free);
++  fc_refresh_sidebar(hwnd);
++}
++
++static void fc_group_remove_item(HWND hwnd, const char *path)
++{
++  if (!path||!*path) return;
++  char gp[PATH_MAX]; fc_groups_path(gp, sizeof(gp));
++  char enc[PATH_MAX*3]; fc_url_encode_path(path, enc, sizeof(enc));
++  char uri[PATH_MAX*3+8]; snprintf(uri, sizeof(uri), "file://%s", enc);
++  size_t ulen=strlen(uri);
++  WDL_PtrList<char> lines; bool found=false;
++  FILE *f=fopen(gp,"r");
++  if (f) {
++    char line[PATH_MAX*3+256];
++    while(fgets(line,sizeof(line),f)) {
++      size_t l=strlen(line); while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r')) line[--l]=0;
++      if (strncmp(line,uri,ulen)==0&&(line[ulen]==0||line[ulen]==' '||line[ulen]=='\t')) found=true;
++      else lines.Add(strdup(line));
++    }
++    fclose(f);
++  }
++  if (found) {
++    f=fopen(gp,"w");
++    if(f){for(int i=0;i<lines.GetSize();i++)fprintf(f,"%s\n",lines.Get(i));fclose(f);}
++    fc_refresh_sidebar(hwnd);
++  }
++  lines.Empty(true,free);
++}
++
++static void fc_group_rename_section(HWND hwnd, const char *old_name, const char *new_name)
++{
++  if (!old_name||!new_name||!*old_name||!*new_name) return;
++  char gp[PATH_MAX]; fc_groups_path(gp, sizeof(gp));
++  WDL_PtrList<char> lines; bool found=false;
++  FILE *f=fopen(gp,"r");
++  if(f){char line[512];while(fgets(line,sizeof(line),f)){size_t l=strlen(line);while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r'))line[--l]=0;lines.Add(strdup(line));}fclose(f);}
++  f=fopen(gp,"w"); if(!f){lines.Empty(true,free);return;}
++  for(int i=0;i<lines.GetSize();i++){
++    const char *l=lines.Get(i);
++    if(l[0]=='['){char *dup=strdup(l+1);char *e=strchr(dup,']');if(e)*e=0;if(!strcmp(dup,old_name)){fprintf(f,"[%s]\n",new_name);found=true;free(dup);continue;}free(dup);}
++    fprintf(f,"%s\n",l);
++  }
++  fclose(f); lines.Empty(true,free);
++  if(found) fc_refresh_sidebar(hwnd);
++}
++
++static void fc_group_delete_section(HWND hwnd, const char *section)
++{
++  if (!section||!*section) return;
++  char gp[PATH_MAX]; fc_groups_path(gp, sizeof(gp));
++  WDL_PtrList<char> lines;
++  FILE *f=fopen(gp,"r");
++  if(f){char line[PATH_MAX*3+256];while(fgets(line,sizeof(line),f)){size_t l=strlen(line);while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r'))line[--l]=0;lines.Add(strdup(line));}fclose(f);}
++  f=fopen(gp,"w"); if(!f){lines.Empty(true,free);return;}
++  bool in_sec=false,found=false;
++  for(int i=0;i<lines.GetSize();i++){
++    const char *l=lines.Get(i);
++    if(l[0]=='['){char *dup=strdup(l+1);char *e=strchr(dup,']');if(e)*e=0;bool hit=!strcmp(dup,section);free(dup);if(hit){in_sec=true;found=true;continue;}else in_sec=false;}
++    if(!in_sec) fprintf(f,"%s\n",l);
++  }
++  fclose(f); lines.Empty(true,free);
++  if(found) fc_refresh_sidebar(hwnd);
++}
++
++// ── Places sidebar (tree) ────────────────────────────────────────────────────
++
++static int cmp_strcase(const void *a, const void *b)
++{
++  return strcasecmp(*(const char **)a, *(const char **)b);
++}
++
++static bool browse_has_subdirs(const char *path)
++{
++  DIR *d = opendir(path);
++  if (!d) return false;
++  struct dirent *ent;
++  while ((ent = readdir(d)) != NULL)
++  {
++    if (ent->d_name[0] == '.') continue;
++    bool isdir = false;
++#ifdef DT_DIR
++    if (ent->d_type == DT_DIR) isdir = true;
++    else if (ent->d_type == DT_UNKNOWN || ent->d_type == DT_LNK)
++#endif
++    {
++      char sub[PATH_MAX];
++      snprintf(sub, sizeof(sub), "%s/%s", path, ent->d_name);
++      struct stat st;
++      if (stat(sub, &st) == 0 && S_ISDIR(st.st_mode)) isdir = true;
++    }
++    if (isdir) { closedir(d); return true; }
++  }
++  closedir(d);
++  return false;
++}
++
++static HTREEITEM browse_tree_insert_header(HWND tv, const char *label)
++{
++  TV_INSERTSTRUCT tis;
++  memset(&tis, 0, sizeof(tis));
++  tis.hParent = TVI_ROOT;
++  tis.hInsertAfter = TVI_LAST;
++  tis.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
++  tis.item.pszText = (char*)label;
++  tis.item.lParam = 1; // sentinel: non-navigatable section header
++  tis.item.cChildren = 1; // has children (populated inline, show expand arrow)
++  return TreeView_InsertItem(tv, &tis);
++}
++
++static HTREEITEM browse_tree_insert(HWND tv, HTREEITEM parent, const char *label, const char *path)
++{
++  struct stat st;
++  if (!path || !*path || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return NULL;
++  TV_INSERTSTRUCT tis;
++  memset(&tis, 0, sizeof(tis));
++  tis.hParent = parent ? parent : TVI_ROOT;
++  tis.hInsertAfter = TVI_LAST;
++  tis.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
++  tis.item.pszText = (char*)label;
++  tis.item.lParam = (LPARAM)strdup(path);
++  tis.item.cChildren = browse_has_subdirs(path) ? 1 : 0;
++  return TreeView_InsertItem(tv, &tis);
++}
++
++static void browse_tree_expand(HWND tv, HTREEITEM hitem, const char *path)
++{
++  DIR *d = opendir(path);
++  if (!d) return;
++  WDL_PtrList<char> names;
++  struct dirent *ent;
++  while ((ent = readdir(d)) != NULL)
++  {
++    if (ent->d_name[0] == '.') continue;
++    bool isdir = false;
++#ifdef DT_DIR
++    if (ent->d_type == DT_DIR) isdir = true;
++    else if (ent->d_type == DT_UNKNOWN || ent->d_type == DT_LNK)
++#endif
++    {
++      char sub[PATH_MAX];
++      snprintf(sub, sizeof(sub), "%s/%s", path, ent->d_name);
++      struct stat st;
++      if (stat(sub, &st) == 0 && S_ISDIR(st.st_mode)) isdir = true;
++    }
++    if (isdir) names.Add(strdup(ent->d_name));
++  }
++  closedir(d);
++  qsort(names.GetList(), names.GetSize(), sizeof(char*), cmp_strcase);
++  for (int i = 0; i < names.GetSize(); i++)
++  {
++    char sub[PATH_MAX];
++    snprintf(sub, sizeof(sub), "%s/%s", path, names.Get(i));
++    browse_tree_insert(tv, hitem, names.Get(i), sub);
++    free(names.Get(i));
++  }
++}
++
++static void browse_tree_free(HWND tv, HTREEITEM item)
++{
++  while (item)
++  {
++    HTREEITEM child = TreeView_GetChild(tv, item);
++    if (child) browse_tree_free(tv, child);
++    TVITEM ti;
++    memset(&ti, 0, sizeof(ti));
++    ti.mask = TVIF_PARAM | TVIF_HANDLE;
++    ti.hItem = item;
++    if (TreeView_GetItem(tv, &ti) && ti.lParam > 1) free((char*)ti.lParam);
++    item = TreeView_GetNextSibling(tv, item);
++  }
++}
++
++static void browse_populate_devices(HWND tv)
++{
++  FILE *f = fopen("/proc/mounts", "r");
++  if (!f) return;
++
++  static const char *skip_prefix[] = {
++    "/", "/boot", "/sys", "/proc", "/dev", "/run", "/snap", "/tmp", NULL
++  };
++
++  WDL_PtrList<char> seen_mnts;
++  WDL_PtrList<char> labels;
++  WDL_PtrList<char> paths;
++
++  char line[PATH_MAX + 256];
++  while (fgets(line, sizeof(line), f))
++  {
++    char dev[256], mnt[PATH_MAX], fstype[64];
++    if (sscanf(line, "%255s %4095s %63s", dev, mnt, fstype) < 3) continue;
++    if (strncmp(dev, "/dev/", 5) != 0) continue;
++
++    bool skip = false;
++    for (int i = 0; skip_prefix[i] && !skip; i++)
++    {
++      size_t n = strlen(skip_prefix[i]);
++      if (!strcmp(mnt, skip_prefix[i]) || (!strncmp(mnt, skip_prefix[i], n) && mnt[n] == '/'))
++        skip = true;
++    }
++    if (skip) continue;
++
++    bool dup = false;
++    for (int i = 0; i < seen_mnts.GetSize() && !dup; i++)
++      if (!strcmp(seen_mnts.Get(i), mnt)) dup = true;
++    if (dup) continue;
++
++    struct stat st;
++    if (stat(mnt, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
++
++    seen_mnts.Add(strdup(mnt));
++    const char *lbl = WDL_get_filepart(mnt);
++    labels.Add(strdup(lbl && *lbl ? lbl : mnt));
++    paths.Add(strdup(mnt));
++  }
++  fclose(f);
++
++  if (labels.GetSize() > 0)
++  {
++    HTREEITEM hdr = browse_tree_insert_header(tv, "Devices");
++    for (int i = 0; i < labels.GetSize(); i++)
++      browse_tree_insert(tv, hdr, labels.Get(i), paths.Get(i));
++    TreeView_Expand(tv, hdr, TVE_EXPAND);
++  }
++  seen_mnts.Empty(true, free);
++  labels.Empty(true, free);
++  paths.Empty(true, free);
++}
++
++static void browse_populate_bookmarks(HWND tv)
++{
++  const char *home = getenv("HOME");
++  if (!home || !*home) return;
++  char bmpath[PATH_MAX];
++  snprintf(bmpath, sizeof(bmpath), "%s/.config/gtk-3.0/bookmarks", home);
++  FILE *f = fopen(bmpath, "r");
++  if (!f) return;
++
++  // collect entries first so we only create the header if there are any
++  WDL_PtrList<char> labels, paths;
++  char line[PATH_MAX + 256];
++  while (fgets(line, sizeof(line), f))
++  {
++    if (strncmp(line, "file://", 7) != 0) continue;
++    char *p = line + 7;
++    char *end = p;
++    while (*end && *end != ' ' && *end != '\n' && *end != '\r') end++;
++    char *name = (*end == ' ') ? end + 1 : NULL;
++    *end = 0;
++    if (name) { char *ne = name; while (*ne && *ne != '\n' && *ne != '\r') ne++; *ne = 0; }
++    char *r = p, *w = p;
++    while (*r)
++    {
++      if (*r == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2]))
++      {
++        char hex[3] = { r[1], r[2], 0 };
++        *w++ = (char)strtol(hex, NULL, 16);
++        r += 3;
++      }
++      else *w++ = *r++;
++    }
++    *w = 0;
++    if (!*p) continue;
++    const char *label = (name && *name) ? name : WDL_get_filepart(p);
++    labels.Add(strdup(label));
++    paths.Add(strdup(p));
++  }
++  fclose(f);
++
++  if (labels.GetSize() > 0)
++  {
++    HTREEITEM hdr = browse_tree_insert_header(tv, "Bookmarks");
++    for (int i = 0; i < labels.GetSize(); i++)
++      browse_tree_insert(tv, hdr, labels.Get(i), paths.Get(i));
++    TreeView_Expand(tv, hdr, TVE_EXPAND);
++  }
++  labels.Empty(true, free);
++  paths.Empty(true, free);
++}
++
++static void browse_populate_places(HWND tv)
++{
++  const char *home = getenv("HOME");
++  if (!home || !*home) return;
++
++  WDL_PtrList<char> seen; // deduplicate paths
++  HTREEITEM places_hdr = browse_tree_insert_header(tv, "Places");
++
++  auto try_add = [&](const char *label, const char *path) {
++    if (!path || !*path) return;
++    for (int i = 0; i < seen.GetSize(); i++)
++      if (!strcmp(seen.Get(i), path)) return;
++    if (browse_tree_insert(tv, places_hdr, label, path))
++      seen.Add(strdup(path));
++  };
++  try_add("Home", home);
++
++  static const struct { const char *key; const char *label; } xdg_map[] = {
++    { "XDG_DESKTOP_DIR",   "Desktop"   },
++    { "XDG_DOWNLOAD_DIR",  "Downloads" },
++    { "XDG_DOCUMENTS_DIR", "Documents" },
++    { "XDG_MUSIC_DIR",     "Music"     },
++    { "XDG_PICTURES_DIR",  "Pictures"  },
++    { "XDG_VIDEOS_DIR",    "Videos"    },
++    { NULL, NULL }
++  };
++
++  char fpath[PATH_MAX];
++  snprintf(fpath, sizeof(fpath), "%s/.config/user-dirs.dirs", home);
++  FILE *f = fopen(fpath, "r");
++  bool got_xdg = false;
++  if (f)
++  {
++    char line[PATH_MAX + 64];
++    while (fgets(line, sizeof(line), f))
++    {
++      if (line[0] == '#' || line[0] == '\n') continue;
++      char *eq = strchr(line, '=');
++      if (!eq) continue;
++      *eq = 0;
++      char *val = eq + 1;
++      if (*val == '"') val++;
++      char *vend = val;
++      while (*vend && *vend != '"' && *vend != '\n' && *vend != '\r') vend++;
++      *vend = 0;
++      char expanded[PATH_MAX];
++      if (strncmp(val, "$HOME", 5) == 0)
++        snprintf(expanded, sizeof(expanded), "%s%s", home, val + 5);
++      else
++        lstrcpyn_safe(expanded, val, sizeof(expanded));
++      for (int i = 0; xdg_map[i].key; i++)
++        if (!strcmp(line, xdg_map[i].key))
++        {
++          try_add(xdg_map[i].label, expanded);
++          got_xdg = true;
++          break;
++        }
++    }
++    fclose(f);
++  }
++  if (!got_xdg)
++  {
++    static const char *std[] = { "Desktop","Downloads","Documents","Music","Pictures","Videos",NULL };
++    for (int i = 0; std[i]; i++)
++    {
++      snprintf(fpath, sizeof(fpath), "%s/%s", home, std[i]);
++      try_add(std[i], fpath);
++    }
++  }
++
++  // Trash — at bottom of Places
++  char trash[PATH_MAX];
++  snprintf(trash, sizeof(trash), "%s/.local/share/Trash/files", home);
++  try_add("Trash", trash);
++
++  seen.Empty(true, free);
++  TreeView_Expand(tv, places_hdr, TVE_EXPAND);
++
++  // User-defined named groups
++  browse_populate_groups(tv);
++
++  // Devices section (reads /proc/mounts)
++  browse_populate_devices(tv);
++}
++
++// ── end Places sidebar ───────────────────────────────────────────────────────
++
+ static LRESULT WINAPI swellFileSelectProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+ {
+-  enum { IDC_EDIT=0x100, IDC_LABEL, IDC_CHILD, IDC_DIR, IDC_LIST, IDC_EXT, IDC_PARENTBUTTON, IDC_FILTER, ID_SHOW_HIDDEN };
++  enum { IDC_EDIT=0x100, IDC_LABEL, IDC_CHILD, IDC_DIR, IDC_LIST, IDC_EXT, IDC_PARENTBUTTON, IDC_FILTER, ID_SHOW_HIDDEN,
++         IDC_PLACES=FC_IDC_PLACES, IDC_PLACES_TOGGLE=FC_IDC_PLACES_TOGGLE };
+   enum { WM_UPD=WM_USER+100 };
+   const int maxPathLen = 2048;
+   const char *multiple_files = "(multiple files)";
+@@ -410,15 +1189,16 @@
+ 
+         const char *ent = parms->mode == BrowseFile_State::OPENDIR ? "dir_browser" : "file_browser";
+         GetPrivateProfileString(".swell",ent,"", tmp,sizeof(tmp),"");
+-        int x=0,y=0,w=0,h=0, c1=0,c2=0,c3=0,extraflag=0;
++        int x=0,y=0,w=0,h=0, c1=0,c2=0,c3=0,extraflag=0,sbw_ini=0;
+         int flag = SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER;
+-        if (tmp[0] && 
+-            sscanf(tmp,"%d %d %d %d %d %d %d %d",&x,&y,&w,&h,&c1,&c2,&c3,&extraflag) >= 4) 
++        if (tmp[0] &&
++            sscanf(tmp,"%d %d %d %d %d %d %d %d %d",&x,&y,&w,&h,&c1,&c2,&c3,&extraflag,&sbw_ini) >= 4)
+           flag &= ~SWP_NOMOVE;
+         if (w < 100) w=SWELL_UI_SCALE(600);
+         if (h < 100) h=SWELL_UI_SCALE(400);
+-        if (extraflag&1)
+-          parms->show_hidden=true;
++        if (extraflag&1) parms->show_hidden=true;
++        if (extraflag&2) parms->places_visible=false;
++        if (sbw_ini >= SWELL_UI_SCALE(60) && sbw_ini <= SWELL_UI_SCALE(400)) parms->places_width=sbw_ini;
+ 
+         if (c1 + c2 + c3 < w/2)
+         {
+@@ -447,6 +1227,31 @@
+           hi.fmt = parms->sortrev ? HDF_SORTDOWN : HDF_SORTUP;
+           Header_SetItem(hdr,parms->sortcol,&hi);
+         }
++        {
++          HWND places = SWELL_MakeControl("", IDC_PLACES, "SysTreeView32", WS_BORDER, 0,0,0,0,0);
++          if (places)
++          {
++            static HFONT s_places_font;
++            if (!s_places_font)
++              s_places_font = CreateFont(-(g_swell_ctheme.default_font_size + 2),
++                0,0,0,FW_NORMAL,0,0,0,0,0,0,0,0,g_swell_deffont_face);
++            if (s_places_font) SendMessage(places, WM_SETFONT, (WPARAM)s_places_font, 0);
++            browse_populate_places(places);
++          }
++          SWELL_MakeButton(0, "+ Group", FC_IDC_SB_NEW_GROUP, 0,0,0,0, 0);
++          SWELL_MakeButton(0, "\xe2\x9a\x99", FC_IDC_SB_MANAGE, 0,0,0,0, 0);
++          SWELL_MakeButton(0, parms->places_visible ? "\xe2\x97\x80" : "\xe2\x96\xb6",
++                           IDC_PLACES_TOGGLE, 0,0,0,0, 0);
++          {
++            HWND tog = GetDlgItem(hwnd, IDC_PLACES_TOGGLE);
++            if (tog)
++            {
++              WNDPROC orig = (WNDPROC)SetWindowLongPtr(tog, GWL_WNDPROC, (LONG_PTR)splitter_wndproc);
++              SetWindowLongPtr(tog, GWLP_USERDATA, (LONG_PTR)orig);
++            }
++          }
++        }
++
+         HWND extlist = (parms->extlist && *parms->extlist) ? SWELL_MakeCombo(IDC_EXT, 0,0,0,0, CBS_DROPDOWNLIST) : NULL;
+         if (extlist)
+         {
+@@ -525,6 +1330,8 @@
+     break;
+     case WM_DESTROY:
+       {
++        HWND places = GetDlgItem(hwnd, IDC_PLACES);
++        if (places) browse_tree_free(places, TreeView_GetRoot(places));
+         BrowseFile_State *parms = (BrowseFile_State *)GetWindowLongPtr(hwnd,GWLP_USERDATA);
+         if (parms)
+         {
+@@ -536,8 +1343,10 @@
+           const int c3 = ListView_GetColumnWidth(list,2);
+           char tmp[128];
+           int extraflag=0;
+-          if (parms->show_hidden) extraflag|=1;
+-          snprintf(tmp,sizeof(tmp),"%d %d %d %d %d %d %d %d",r.left,r.top,r.right-r.left,r.bottom-r.top,c1,c2,c3,extraflag);
++          if (parms->show_hidden)    extraflag|=1;
++          if (!parms->places_visible) extraflag|=2;
++          snprintf(tmp,sizeof(tmp),"%d %d %d %d %d %d %d %d %d",
++                   r.left,r.top,r.right-r.left,r.bottom-r.top,c1,c2,c3,extraflag,parms->places_width);
+           const char *ent = parms->mode == BrowseFile_State::OPENDIR ? "dir_browser" : "file_browser";
+           WritePrivateProfileString(".swell",ent, tmp, "");
+         }
+@@ -675,20 +1484,59 @@
+ 
+         SetWindowPos(GetDlgItem(hwnd,IDC_EDIT), NULL, xborder*2 + fnlblw, ypos -= fnh + yborder, r.right-fnlblw-xborder*3, fnh, SWP_NOZORDER|SWP_NOACTIVATE);
+         SetWindowPos(GetDlgItem(hwnd,IDC_LABEL), NULL, xborder, ypos, fnlblw, fnh, SWP_NOZORDER|SWP_NOACTIVATE);
+-        const int comboh = g_swell_ctheme.combo_height;
+-        const int filterw = wdl_max(r.right/8, SWELL_UI_SCALE(50));
+-        SetWindowPos(GetDlgItem(hwnd,IDC_DIR), NULL, xborder, yborder/2, 
+-            r.right-xborder*4 - comboh - filterw, comboh, SWP_NOZORDER|SWP_NOACTIVATE);
+-
+-        SetWindowPos(GetDlgItem(hwnd,IDC_PARENTBUTTON),NULL,
+-            r.right-xborder*2-comboh - filterw,yborder/2,
+-            comboh,comboh,SWP_NOZORDER|SWP_NOACTIVATE);
+-
+-        SetWindowPos(GetDlgItem(hwnd,IDC_FILTER),NULL,
+-            r.right-xborder-filterw,yborder/2 + (comboh-fnh)/2,
+-            filterw,fnh,SWP_NOZORDER|SWP_NOACTIVATE);
++        {
++          BrowseFile_State *szparms = (BrowseFile_State *)GetWindowLongPtr(hwnd,GWLP_USERDATA);
++          const bool pv    = !szparms || szparms->places_visible;
++          const int sbw    = pv ? (szparms ? szparms->places_width : SWELL_UI_SCALE(140)) : 0;
++          const int tgw    = SWELL_UI_SCALE(14);
++          const int list_x = xborder + sbw + tgw;
++          const int comboh = g_swell_ctheme.combo_height;
++          const int filterw = wdl_max(r.right/8, SWELL_UI_SCALE(50));
++          const int bar_y  = yborder/2;
++          const int top_y  = comboh + yborder;   // file list starts below address bar
++          const int mid_h  = ypos - top_y - yborder;
++          const int full_h = ypos - bar_y - yborder; // sidebar spans full height
++
++          // Address bar — to the right of the sidebar/toggle
++          SetWindowPos(GetDlgItem(hwnd,IDC_DIR), NULL, list_x, bar_y,
++              r.right - xborder*3 - comboh - filterw - list_x, comboh, SWP_NOZORDER|SWP_NOACTIVATE);
++          SetWindowPos(GetDlgItem(hwnd,IDC_PARENTBUTTON), NULL,
++              r.right - xborder*2 - comboh - filterw, bar_y,
++              comboh, comboh, SWP_NOZORDER|SWP_NOACTIVATE);
++          SetWindowPos(GetDlgItem(hwnd,IDC_FILTER), NULL,
++              r.right - xborder - filterw, bar_y + (comboh - fnh)/2,
++              filterw, fnh, SWP_NOZORDER|SWP_NOACTIVATE);
++
++          // Sidebar mini toolbar (new group + manage) — same row as address bar
++          {
++            HWND sbnew = GetDlgItem(hwnd, FC_IDC_SB_NEW_GROUP);
++            HWND sbmgr = GetDlgItem(hwnd, FC_IDC_SB_MANAGE);
++            if (sbnew && sbmgr)
++            {
++              ShowWindow(sbnew, pv ? SW_SHOW : SW_HIDE);
++              ShowWindow(sbmgr, pv ? SW_SHOW : SW_HIDE);
++              if (pv && sbw > 0)
++              {
++                const int mgr_w = comboh;
++                SetWindowPos(sbnew, NULL, xborder, bar_y, sbw - mgr_w, comboh, SWP_NOZORDER|SWP_NOACTIVATE);
++                SetWindowPos(sbmgr, NULL, xborder + sbw - mgr_w, bar_y, mgr_w, comboh, SWP_NOZORDER|SWP_NOACTIVATE);
++              }
++            }
++          }
++          // Sidebar tree — full height minus toolbar row
++          HWND places = GetDlgItem(hwnd, IDC_PLACES);
++          if (places)
++          {
++            ShowWindow(places, pv ? SW_SHOW : SW_HIDE);
++            if (pv) SetWindowPos(places, NULL, xborder, bar_y + comboh, sbw, full_h - comboh, SWP_NOZORDER|SWP_NOACTIVATE);
++          }
++          SetWindowPos(GetDlgItem(hwnd,IDC_PLACES_TOGGLE), NULL,
++              xborder + sbw, bar_y, tgw, full_h, SWP_NOZORDER|SWP_NOACTIVATE);
+ 
+-        SetWindowPos(GetDlgItem(hwnd,IDC_LIST), NULL, xborder, g_swell_ctheme.combo_height+yborder, r.right-xborder*2, ypos - (g_swell_ctheme.combo_height+yborder) - yborder, SWP_NOZORDER|SWP_NOACTIVATE);
++          // File list — right pane, below address bar
++          SetWindowPos(GetDlgItem(hwnd,IDC_LIST), NULL,
++              list_x, top_y, r.right - xborder - list_x, mid_h, SWP_NOZORDER|SWP_NOACTIVATE);
++        }
+       }
+     break;
+     case WM_TIMER:
+@@ -710,6 +1558,76 @@
+     case WM_COMMAND:
+       switch (LOWORD(wParam))
+       {
++        case IDC_PLACES_TOGGLE:
++          {
++            BrowseFile_State *parms = (BrowseFile_State *)GetWindowLongPtr(hwnd,GWLP_USERDATA);
++            if (parms)
++            {
++              parms->places_visible = !parms->places_visible;
++              SetWindowText(GetDlgItem(hwnd, IDC_PLACES_TOGGLE),
++                  parms->places_visible ? "\xe2\x97\x80" : "\xe2\x96\xb6"); // ◀ / ▶
++              RECT cr; GetClientRect(hwnd, &cr);
++              SendMessage(hwnd, WM_SIZE, 0, 0);
++            }
++          }
++        return 0;
++        case FC_IDC_SB_NEW_GROUP:
++          {
++            swellInputState gs={"New group","Group name:","",""};
++            if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&gs)&&gs.result[0]) {
++              char gp[PATH_MAX]; fc_groups_path(gp,sizeof(gp));
++              WDL_PtrList<char> secs; fc_groups_get_sections(secs);
++              bool dup=false;
++              for(int si=0;si<secs.GetSize();si++) if(!strcmp(secs.Get(si),gs.result)){dup=true;break;}
++              secs.Empty(true,free);
++              if (!dup) {
++                FILE *f=fopen(gp,"a");
++                if(f){fprintf(f,"\n[%s]\n",gs.result);fclose(f);}
++                fc_refresh_sidebar(hwnd);
++              }
++            }
++          }
++        return 0;
++        case FC_IDC_SB_MANAGE:
++          {
++            WDL_PtrList<char> secs; fc_groups_get_sections(secs);
++            HMENU m=CreatePopupMenu(); int pos=0;
++            for(int si=0;si<secs.GetSize()&&si<64;si++) {
++              HMENU gsub=CreatePopupMenu();
++              SWELL_InsertMenu(gsub,0,MF_BYPOSITION,ID_FC_MANAGE_RENAME_BASE+si,"Rename...");
++              SWELL_InsertMenu(gsub,1,MF_BYPOSITION,ID_FC_MANAGE_DELETE_BASE+si,"Delete");
++              SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_POPUP,(UINT_PTR)gsub,secs.Get(si));
++            }
++            if(secs.GetSize()>0)
++              SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_SEPARATOR,0,"");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_GROUP_NEW_SECTION,"New group...");
++            POINT pt; GetCursorPos(&pt);
++            int cmd=TrackPopupMenu(m,TPM_RETURNCMD,pt.x,pt.y,0,hwnd,NULL);
++            DestroyMenu(m);
++            if(cmd>=ID_FC_MANAGE_RENAME_BASE&&cmd<ID_FC_MANAGE_RENAME_BASE+64) {
++              int idx=cmd-ID_FC_MANAGE_RENAME_BASE;
++              if(idx<secs.GetSize()) {
++                swellInputState is={"Rename group","New name:",secs.Get(idx),""};
++                if(DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0]&&strcmp(is.result,secs.Get(idx)))
++                  fc_group_rename_section(hwnd,secs.Get(idx),is.result);
++              }
++            } else if(cmd>=ID_FC_MANAGE_DELETE_BASE&&cmd<ID_FC_MANAGE_DELETE_BASE+64) {
++              int idx=cmd-ID_FC_MANAGE_DELETE_BASE;
++              if(idx<secs.GetSize()) fc_group_delete_section(hwnd,secs.Get(idx));
++            } else if(cmd==ID_FC_GROUP_NEW_SECTION) {
++              swellInputState gs={"New group","Group name:","",""};
++              if(DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&gs)&&gs.result[0]) {
++                char gp[PATH_MAX]; fc_groups_path(gp,sizeof(gp));
++                WDL_PtrList<char> secs2; fc_groups_get_sections(secs2);
++                bool dup=false;
++                for(int si=0;si<secs2.GetSize();si++) if(!strcmp(secs2.Get(si),gs.result)){dup=true;break;}
++                secs2.Empty(true,free);
++                if(!dup){FILE *f=fopen(gp,"a");if(f){fprintf(f,"\n[%s]\n",gs.result);fclose(f);}fc_refresh_sidebar(hwnd);}
++              }
++            }
++            secs.Empty(true,free);
++          }
++        return 0;
+         case IDC_FILTER:
+           if (HIWORD(wParam) == EN_CHANGE)
+           {
+@@ -958,11 +1876,312 @@
+             SendMessage(hwnd,WM_UPD,1,0);
+           }
+         return 0;
++        case ID_FC_NEWFOLDER:
++          {
++            char dir[2048]; GetDlgItemText(hwnd,IDC_DIR,dir,sizeof(dir));
++            swellInputState is={"New folder","Folder name:","New folder",""};
++            if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0]) {
++              char nd[PATH_MAX]; snprintf(nd,sizeof(nd),"%s/%s",dir,is.result);
++              if (mkdir(nd,0755)==0) SendMessage(hwnd,WM_UPD,1,0);
++              else MessageBox(hwnd,"Could not create folder","Error",MB_OK);
++            }
++          }
++        return 0;
++        case ID_FC_RENAME:
++          {
++            BrowseFile_State *parms=(BrowseFile_State*)GetWindowLongPtr(hwnd,GWLP_USERDATA);
++            HWND list=GetDlgItem(hwnd,IDC_LIST);
++            int selidx=ListView_GetNextItem(list,-1,LVNI_SELECTED);
++            if (selidx>=0&&parms) {
++              struct BrowseFile_State::rec *rec=parms->viewlist.Get(selidx);
++              if (rec&&rec->name) {
++                char dir[2048]; GetDlgItemText(hwnd,IDC_DIR,dir,sizeof(dir));
++                char oldpath[PATH_MAX]; snprintf(oldpath,sizeof(oldpath),"%s/%s",dir,rec->name);
++                swellInputState is={"Rename","New name:",rec->name,""};
++                if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0]&&strcmp(is.result,rec->name)) {
++                  char np[PATH_MAX]; snprintf(np,sizeof(np),"%s/%s",dir,is.result);
++                  if (rename(oldpath,np)==0) SendMessage(hwnd,WM_UPD,1,0);
++                  else MessageBox(hwnd,"Could not rename","Error",MB_OK);
++                }
++              }
++            }
++          }
++        return 0;
++        case ID_FC_TRASH:
++          {
++            BrowseFile_State *parms=(BrowseFile_State*)GetWindowLongPtr(hwnd,GWLP_USERDATA);
++            HWND list=GetDlgItem(hwnd,IDC_LIST);
++            if (!parms) return 0;
++            char dir[2048]; GetDlgItemText(hwnd,IDC_DIR,dir,sizeof(dir));
++            int a=ListView_GetNextItem(list,-1,LVNI_SELECTED); bool any=false;
++            while (a!=-1) {
++              struct BrowseFile_State::rec *rec=parms->viewlist.Get(a);
++              if (rec&&rec->name) {
++                char fp[PATH_MAX]; snprintf(fp,sizeof(fp),"%s/%s",dir,rec->name);
++                fc_trash_file(fp); any=true;
++              }
++              a=ListView_GetNextItem(list,a,LVNI_SELECTED);
++            }
++            if (any) SendMessage(hwnd,WM_UPD,1,0);
++          }
++        return 0;
++        case ID_FC_COPY:
++        case ID_FC_CUT:
++          {
++            BrowseFile_State *parms=(BrowseFile_State*)GetWindowLongPtr(hwnd,GWLP_USERDATA);
++            HWND list=GetDlgItem(hwnd,IDC_LIST);
++            if (!parms) return 0;
++            char dir[2048]; GetDlgItemText(hwnd,IDC_DIR,dir,sizeof(dir));
++            s_fc_clip.clear();
++            s_fc_clip.is_cut=(LOWORD(wParam)==ID_FC_CUT);
++            int a=ListView_GetNextItem(list,-1,LVNI_SELECTED);
++            while (a!=-1) {
++              struct BrowseFile_State::rec *rec=parms->viewlist.Get(a);
++              if (rec&&rec->name) {
++                char fp[PATH_MAX]; snprintf(fp,sizeof(fp),"%s/%s",dir,rec->name);
++                s_fc_clip.paths.Add(strdup(fp));
++              }
++              a=ListView_GetNextItem(list,a,LVNI_SELECTED);
++            }
++            if (s_fc_clip.paths.GetSize()>0) fc_set_system_clip(hwnd,s_fc_clip.paths,s_fc_clip.is_cut);
++          }
++        return 0;
++        case ID_FC_PASTE:
++          {
++            BrowseFile_State *parms=(BrowseFile_State*)GetWindowLongPtr(hwnd,GWLP_USERDATA);
++            if (!parms) return 0;
++            char dir[2048]; GetDlgItemText(hwnd,IDC_DIR,dir,sizeof(dir));
++            size_t dl=strlen(dir); if (dl>0&&dir[dl-1]=='/') dir[--dl]=0;
++            WDL_PtrList<char> *srcs=NULL; bool is_cut=false;
++            WDL_PtrList<char> sys_paths;
++            if (s_fc_clip.paths.GetSize()>0) {
++              srcs=&s_fc_clip.paths; is_cut=s_fc_clip.is_cut;
++            } else {
++              OpenClipboard(hwnd);
++              HANDLE hc=GetClipboardData(CF_HDROP);
++              if (hc) {
++                DROPFILES *df=(DROPFILES*)GlobalLock(hc);
++                if (df) { const char *pp=(const char*)df+df->pFiles; while(*pp){sys_paths.Add(strdup(pp));pp+=strlen(pp)+1;} GlobalUnlock(hc); }
++              }
++              CloseClipboard();
++              if (sys_paths.GetSize()>0) srcs=&sys_paths;
++            }
++            if (!srcs||srcs->GetSize()==0) return 0;
++            bool any_err=false;
++            for (int i=0;i<srcs->GetSize();i++) {
++              const char *src=srcs->Get(i);
++              char dst[PATH_MAX]; snprintf(dst,sizeof(dst),"%s/%s",dir,WDL_get_filepart(src));
++              if (strcmp(src,dst)==0) continue;
++              if (is_cut) { if (rename(src,dst)!=0) any_err=true; }
++              else {
++                struct stat st;
++                if (stat(src,&st)==0) {
++                  if (S_ISREG(st.st_mode)) { if (!fc_copy_file(src,dst)) any_err=true; }
++                  else if (S_ISDIR(st.st_mode)) {
++                    pid_t pid=fork();
++                    if (pid==0){execlp("cp","cp","-rp",src,dst,(char*)NULL);_exit(1);}
++                    else if (pid>0){int ws;waitpid(pid,&ws,0);if(!WIFEXITED(ws)||WEXITSTATUS(ws)!=0)any_err=true;}
++                    else any_err=true;
++                  }
++                } else any_err=true;
++              }
++            }
++            sys_paths.Empty(true,free);
++            if (is_cut&&!any_err) s_fc_clip.clear();
++            if (any_err) MessageBox(hwnd,"Some files could not be pasted","Warning",MB_OK);
++            SendMessage(hwnd,WM_UPD,1,0);
++          }
++        return 0;
++        case ID_FC_COPYPATH:
++          {
++            BrowseFile_State *parms=(BrowseFile_State*)GetWindowLongPtr(hwnd,GWLP_USERDATA);
++            HWND list=GetDlgItem(hwnd,IDC_LIST);
++            int selidx=ListView_GetNextItem(list,-1,LVNI_SELECTED);
++            char dir[2048]; GetDlgItemText(hwnd,IDC_DIR,dir,sizeof(dir));
++            char fp[PATH_MAX];
++            if (selidx>=0&&parms) {
++              struct BrowseFile_State::rec *rec=parms->viewlist.Get(selidx);
++              if (rec&&rec->name) snprintf(fp,sizeof(fp),"%s/%s",dir,rec->name);
++              else lstrcpyn_safe(fp,dir,sizeof(fp));
++            } else lstrcpyn_safe(fp,dir,sizeof(fp));
++            OpenClipboard(hwnd); EmptyClipboard();
++            size_t l=strlen(fp)+1; HANDLE hh=GlobalAlloc(GMEM_MOVEABLE,l);
++            if (hh){char *q=(char*)GlobalLock(hh);if(q){memcpy(q,fp,l);GlobalUnlock(hh);}SetClipboardData(CF_TEXT,hh);}
++            CloseClipboard();
++          }
++        return 0;
++        case ID_FC_OPENFILEMANAGER:
++          {
++            char dir[2048]; GetDlgItemText(hwnd,IDC_DIR,dir,sizeof(dir));
++            pid_t pid=fork();
++            if (pid==0){setsid();execlp("xdg-open","xdg-open",dir,(char*)NULL);_exit(1);}
++            else if (pid>0) waitpid(pid,NULL,WNOHANG);
++          }
++        return 0;
++        case ID_FC_SIDEBAR_ADD:
++          {
++            char dir[2048]; GetDlgItemText(hwnd,IDC_DIR,dir,sizeof(dir));
++            WDL_PtrList<char> secs; fc_groups_get_sections(secs);
++            if (secs.GetSize() == 0) {
++              // No groups yet — create new group and add
++              swellInputState gs={"New group","Group name:","",""};
++              if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&gs)&&gs.result[0]) {
++                swellInputState is={"Add to group","Name:",WDL_get_filepart(dir),""};
++                if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0])
++                  fc_group_add(hwnd, gs.result, dir, is.result);
++              }
++            } else {
++              // Pick existing group or create new
++              HMENU sub=CreatePopupMenu(); int sp=0;
++              for (int si=0; si<secs.GetSize() && si<128; si++)
++                SWELL_InsertMenu(sub, sp++, MF_BYPOSITION, ID_FC_GROUP_ADD_BASE+si, secs.Get(si));
++              SWELL_InsertMenu(sub, sp++, MF_BYPOSITION|MF_SEPARATOR, 0, "");
++              SWELL_InsertMenu(sub, sp++, MF_BYPOSITION, ID_FC_GROUP_NEW_SECTION, "New group...");
++              POINT pt; GetCursorPos(&pt);
++              int cmd=TrackPopupMenu(sub, TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, NULL);
++              DestroyMenu(sub);
++              if (cmd >= ID_FC_GROUP_ADD_BASE && cmd < ID_FC_GROUP_NEW_SECTION) {
++                WDL_PtrList<char> secs2; fc_groups_get_sections(secs2);
++                int idx = cmd - ID_FC_GROUP_ADD_BASE;
++                if (idx < secs2.GetSize()) {
++                  const char *sname = secs2.Get(idx);
++                  swellInputState is={"Add to group","Name:",WDL_get_filepart(dir),""};
++                  if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0])
++                    fc_group_add(hwnd, sname, dir, is.result);
++                }
++                secs2.Empty(true,free);
++              } else if (cmd == ID_FC_GROUP_NEW_SECTION) {
++                swellInputState gs={"New group","Group name:","",""};
++                if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&gs)&&gs.result[0]) {
++                  swellInputState is={"Add to group","Name:",WDL_get_filepart(dir),""};
++                  if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0])
++                    fc_group_add(hwnd, gs.result, dir, is.result);
++                }
++              }
++            }
++            secs.Empty(true,free);
++          }
++        return 0;
++        case ID_FC_SIDEBAR_REMOVE:
++          // handled inline in WM_CONTEXTMENU
++        return 0;
+       }
+     break;
+     case WM_NOTIFY:
+       {
+         LPNMHDR l=(LPNMHDR)lParam;
++        if (l->idFrom == IDC_PLACES)
++        {
++          NMTREEVIEW *nmtv = (NMTREEVIEW*)lParam;
++          if (l->code == TVN_SELCHANGED)
++          {
++            char *path = (char*)nmtv->itemNew.lParam;
++            if (lp_is_path((LPARAM)path))
++            {
++              char buf[2048];
++              lstrcpyn_safe(buf, path, sizeof(buf));
++              SendMessage(hwnd, WM_UPD, IDC_DIR, (LPARAM)buf);
++              SendMessage(hwnd, WM_UPD, 1, 0);
++            }
++          }
++          else if (l->code == TVN_ITEMEXPANDING && nmtv->action == TVE_EXPAND)
++          {
++            HTREEITEM first = TreeView_GetChild((HWND)l->hwndFrom, nmtv->itemNew.hItem);
++            if (!first)
++            {
++              char *path = (char*)nmtv->itemNew.lParam;
++              if (lp_is_path((LPARAM)path)) browse_tree_expand((HWND)l->hwndFrom, nmtv->itemNew.hItem, path);
++            }
++          }
++          else if (l->code == NM_RCLICK)
++          {
++            // WM_RBUTTONDOWN already selected the item (swell-wnd-generic patch),
++            // so GetSelection and IDC_DIR both reflect what was right-clicked
++            HTREEITEM hitem = TreeView_GetSelection((HWND)l->hwndFrom);
++            const char *item_path = NULL;
++            const char *group_hdr = NULL;
++            if (hitem) {
++              TVITEM ti; memset(&ti,0,sizeof(ti));
++              ti.mask=TVIF_PARAM|TVIF_HANDLE; ti.hItem=hitem;
++              if (TreeView_GetItem((HWND)l->hwndFrom,&ti)) {
++                if (lp_is_path(ti.lParam)) item_path=(const char*)ti.lParam;
++                else if (lp_is_group_hdr(ti.lParam)) group_hdr=(const char*)ti.lParam+1;
++              }
++            }
++            char cur_dir[2048]; GetDlgItemText(hwnd, IDC_DIR, cur_dir, sizeof(cur_dir));
++            POINT p; GetCursorPos(&p);
++            // build "Add to group ▶" submenu
++            WDL_PtrList<char> secs;
++            fc_groups_get_sections(secs);
++            HMENU sub = CreatePopupMenu(); int sp=0;
++            for (int si=0; si<secs.GetSize() && si<128; si++)
++              SWELL_InsertMenu(sub, sp++, MF_BYPOSITION, ID_FC_GROUP_ADD_BASE+si, secs.Get(si));
++            if (secs.GetSize()) SWELL_InsertMenu(sub, sp++, MF_BYPOSITION|MF_SEPARATOR, 0, "");
++            SWELL_InsertMenu(sub, sp++, MF_BYPOSITION, ID_FC_GROUP_NEW_SECTION, "New group...");
++            HMENU m = CreatePopupMenu(); int pos=0;
++            SWELL_InsertMenu(m, pos++, MF_BYPOSITION|MF_POPUP, (UINT_PTR)sub, "Add to group");
++            if (item_path) {
++              SWELL_InsertMenu(m, pos++, MF_BYPOSITION, ID_FC_SIDEBAR_REMOVE, "Remove from sidebar");
++              SWELL_InsertMenu(m, pos++, MF_BYPOSITION|MF_SEPARATOR, 0, "");
++              SWELL_InsertMenu(m, pos++, MF_BYPOSITION, ID_FC_COPYPATH, "Copy path");
++              SWELL_InsertMenu(m, pos++, MF_BYPOSITION, ID_FC_OPENFILEMANAGER, "Open in file manager");
++            }
++            if (group_hdr) {
++              SWELL_InsertMenu(m, pos++, MF_BYPOSITION|MF_SEPARATOR, 0, "");
++              SWELL_InsertMenu(m, pos++, MF_BYPOSITION, ID_FC_GROUP_RENAME, "Rename group");
++              SWELL_InsertMenu(m, pos++, MF_BYPOSITION, ID_FC_GROUP_DELETE, "Delete group");
++            }
++            int cmd = TrackPopupMenu(m, TPM_RETURNCMD, p.x, p.y, 0, hwnd, NULL);
++            DestroyMenu(m); // also destroys sub
++            char item_path_copy[2048]; item_path_copy[0]=0;
++            if (item_path) lstrcpyn_safe(item_path_copy, item_path, sizeof(item_path_copy));
++            char group_hdr_copy[256]; group_hdr_copy[0]=0;
++            if (group_hdr) lstrcpyn_safe(group_hdr_copy, group_hdr, sizeof(group_hdr_copy));
++            secs.Empty(true, free);
++            if (cmd >= ID_FC_GROUP_ADD_BASE && cmd < ID_FC_GROUP_NEW_SECTION) {
++              // re-read sections to get name (secs was freed)
++              WDL_PtrList<char> secs2; fc_groups_get_sections(secs2);
++              int idx = cmd - ID_FC_GROUP_ADD_BASE;
++              if (idx < secs2.GetSize()) {
++                const char *sname = secs2.Get(idx);
++                swellInputState is={"Add to group","Name:",WDL_get_filepart(cur_dir),""};
++                if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0])
++                  fc_group_add(hwnd, sname, cur_dir, is.result);
++              }
++              secs2.Empty(true,free);
++            }
++            else if (cmd == ID_FC_GROUP_NEW_SECTION) {
++              swellInputState gs={"New group","Group name:","",""};
++              if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&gs)&&gs.result[0]) {
++                swellInputState is={"Add to group","Name:",WDL_get_filepart(cur_dir),""};
++                if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0])
++                  fc_group_add(hwnd, gs.result, cur_dir, is.result);
++              }
++            }
++            else if (cmd==ID_FC_SIDEBAR_REMOVE && item_path_copy[0]) fc_group_remove_item(hwnd, item_path_copy);
++            else if (cmd==ID_FC_COPYPATH && item_path_copy[0]) {
++              OpenClipboard(hwnd); EmptyClipboard();
++              size_t hl=strlen(item_path_copy)+1; HANDLE hh=GlobalAlloc(GMEM_MOVEABLE,hl);
++              if(hh){char *p2=(char*)GlobalLock(hh);if(p2){memcpy(p2,item_path_copy,hl);GlobalUnlock(hh);}SetClipboardData(CF_TEXT,hh);}
++              CloseClipboard();
++            }
++            else if (cmd==ID_FC_OPENFILEMANAGER && item_path_copy[0]) {
++              pid_t pid=fork();
++              if(pid==0){execlp("xdg-open","xdg-open",item_path_copy,(char*)NULL);_exit(1);}
++              else if(pid>0){int st;waitpid(pid,&st,WNOHANG);}
++            }
++            else if (cmd==ID_FC_GROUP_RENAME && group_hdr_copy[0]) {
++              swellInputState is={"Rename group","New name:",group_hdr_copy,""};
++              if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0]&&strcmp(is.result,group_hdr_copy))
++                fc_group_rename_section(hwnd, group_hdr_copy, is.result);
++            }
++            else if (cmd==ID_FC_GROUP_DELETE && group_hdr_copy[0]) {
++              fc_group_delete_section(hwnd, group_hdr_copy);
++            }
++            return 1;
++          }
++          return 0;
++        }
+         if (l->code == LVN_GETDISPINFO)
+         {
+           BrowseFile_State *parms = (BrowseFile_State *)GetWindowLongPtr(hwnd,GWLP_USERDATA);
+@@ -1066,16 +2285,140 @@
+         SendMessage(hwnd,WM_COMMAND,IDOK,0);
+         return 1;
+       }
++      else if (lParam == (FVIRTKEY|FCONTROL) && wParam == 'C' && GetFocus()==GetDlgItem(hwnd,IDC_LIST))
++      { SendMessage(hwnd,WM_COMMAND,ID_FC_COPY,0); return 1; }
++      else if (lParam == (FVIRTKEY|FCONTROL) && wParam == 'X' && GetFocus()==GetDlgItem(hwnd,IDC_LIST))
++      { SendMessage(hwnd,WM_COMMAND,ID_FC_CUT,0); return 1; }
++      else if (lParam == (FVIRTKEY|FCONTROL) && wParam == 'V')
++      { SendMessage(hwnd,WM_COMMAND,ID_FC_PASTE,0); return 1; }
++      else if (lParam == FVIRTKEY && wParam == VK_DELETE && GetFocus()==GetDlgItem(hwnd,IDC_LIST))
++      { SendMessage(hwnd,WM_COMMAND,ID_FC_TRASH,0); return 1; }
++      else if (lParam == FVIRTKEY && wParam == VK_F2 && GetFocus()==GetDlgItem(hwnd,IDC_LIST))
++      { SendMessage(hwnd,WM_COMMAND,ID_FC_RENAME,0); return 1; }
++      else if (lParam == (FVIRTKEY|FCONTROL|FSHIFT) && wParam == 'N')
++      { SendMessage(hwnd,WM_COMMAND,ID_FC_NEWFOLDER,0); return 1; }
+     return 0;
+     case WM_CONTEXTMENU:
+       {
+         BrowseFile_State *parms = (BrowseFile_State *)GetWindowLongPtr(hwnd,GWLP_USERDATA);
+-        HMENU menu = CreatePopupMenu();
+-        SWELL_InsertMenu(menu,0,MF_BYPOSITION|(parms->show_hidden ? MF_CHECKED:MF_UNCHECKED), ID_SHOW_HIDDEN, "Show files/directories beginning with .");
+-        POINT p;
+-        GetCursorPos(&p);
+-        TrackPopupMenu(menu,0,p.x,p.y,0,hwnd,NULL);
+-        DestroyMenu(menu);
++        if (!parms) return 1;
++        HWND places = GetDlgItem(hwnd,IDC_PLACES);
++        HWND list   = GetDlgItem(hwnd,IDC_LIST);
++        HWND hit    = (HWND)wParam;
++        POINT p; GetCursorPos(&p);
++
++        if (hit == places)
++        {
++          // ── Sidebar context menu ───────────────────────────────────────
++          POINT lp=p; ScreenToClient(places,&lp);
++          TVHITTESTINFO thi; memset(&thi,0,sizeof(thi)); thi.pt=lp;
++          HTREEITEM hitem=TreeView_HitTest(places,&thi);
++          const char *item_path=NULL;
++          const char *group_hdr=NULL;
++          if (hitem) {
++            TVITEM ti; memset(&ti,0,sizeof(ti)); ti.mask=TVIF_PARAM|TVIF_HANDLE; ti.hItem=hitem;
++            if (TreeView_GetItem(places,&ti)) {
++              if (lp_is_path(ti.lParam)) item_path=(const char*)ti.lParam;
++              else if (lp_is_group_hdr(ti.lParam)) group_hdr=(const char*)ti.lParam+1;
++            }
++          }
++          char cur_dir[2048]; GetDlgItemText(hwnd,IDC_DIR,cur_dir,sizeof(cur_dir));
++          // build "Add to group ▶" submenu
++          WDL_PtrList<char> secs;
++          fc_groups_get_sections(secs);
++          HMENU sub=CreatePopupMenu(); int sp=0;
++          for (int si=0; si<secs.GetSize() && si<128; si++)
++            SWELL_InsertMenu(sub, sp++, MF_BYPOSITION, ID_FC_GROUP_ADD_BASE+si, secs.Get(si));
++          if (secs.GetSize()) SWELL_InsertMenu(sub, sp++, MF_BYPOSITION|MF_SEPARATOR, 0, "");
++          SWELL_InsertMenu(sub, sp++, MF_BYPOSITION, ID_FC_GROUP_NEW_SECTION, "New group...");
++          HMENU m=CreatePopupMenu(); int pos=0;
++          SWELL_InsertMenu(m, pos++, MF_BYPOSITION|MF_POPUP, (UINT_PTR)sub, "Add to group");
++          if (item_path) {
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_SIDEBAR_REMOVE,"Remove from sidebar");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_SEPARATOR,0,"");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_COPYPATH,"Copy path");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_OPENFILEMANAGER,"Open in file manager");
++          }
++          if (group_hdr) {
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_SEPARATOR,0,"");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_GROUP_RENAME,"Rename group");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_GROUP_DELETE,"Delete group");
++          }
++          int cmd=TrackPopupMenu(m,TPM_RETURNCMD,p.x,p.y,0,hwnd,NULL);
++          DestroyMenu(m); // also destroys sub
++          char item_path_copy[2048]; item_path_copy[0]=0;
++          if (item_path) lstrcpyn_safe(item_path_copy,item_path,sizeof(item_path_copy));
++          char group_hdr_copy[256]; group_hdr_copy[0]=0;
++          if (group_hdr) lstrcpyn_safe(group_hdr_copy,group_hdr,sizeof(group_hdr_copy));
++          secs.Empty(true,free);
++          if (cmd >= ID_FC_GROUP_ADD_BASE && cmd < ID_FC_GROUP_NEW_SECTION) {
++            WDL_PtrList<char> secs2; fc_groups_get_sections(secs2);
++            int idx = cmd - ID_FC_GROUP_ADD_BASE;
++            if (idx < secs2.GetSize()) {
++              const char *sname = secs2.Get(idx);
++              swellInputState is={"Add to group","Name:",WDL_get_filepart(cur_dir),""};
++              if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0])
++                fc_group_add(hwnd, sname, cur_dir, is.result);
++            }
++            secs2.Empty(true,free);
++          }
++          else if (cmd==ID_FC_GROUP_NEW_SECTION) {
++            swellInputState gs={"New group","Group name:","",""};
++            if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&gs)&&gs.result[0]) {
++              swellInputState is={"Add to group","Name:",WDL_get_filepart(cur_dir),""};
++              if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0])
++                fc_group_add(hwnd, gs.result, cur_dir, is.result);
++            }
++          }
++          else if (cmd==ID_FC_SIDEBAR_REMOVE && item_path_copy[0]) fc_group_remove_item(hwnd,item_path_copy);
++          else if (cmd==ID_FC_COPYPATH && item_path_copy[0]) {
++            OpenClipboard(hwnd); EmptyClipboard();
++            size_t l=strlen(item_path_copy)+1; HANDLE hh=GlobalAlloc(GMEM_MOVEABLE,l);
++            if (hh){char *q=(char*)GlobalLock(hh);if(q){memcpy(q,item_path_copy,l);GlobalUnlock(hh);}SetClipboardData(CF_TEXT,hh);}
++            CloseClipboard();
++          }
++          else if (cmd==ID_FC_OPENFILEMANAGER && item_path_copy[0]) {
++            pid_t pid=fork();
++            if (pid==0){setsid();execlp("xdg-open","xdg-open",item_path_copy,(char*)NULL);_exit(1);}
++            else if (pid>0) waitpid(pid,NULL,WNOHANG);
++          }
++          else if (cmd==ID_FC_GROUP_RENAME && group_hdr_copy[0]) {
++            swellInputState is={"Rename group","New name:",group_hdr_copy,""};
++            if (DialogBoxParam(NULL,NULL,hwnd,swellInputProc,(LPARAM)&is)&&is.result[0]&&strcmp(is.result,group_hdr_copy))
++              fc_group_rename_section(hwnd, group_hdr_copy, is.result);
++          }
++          else if (cmd==ID_FC_GROUP_DELETE && group_hdr_copy[0]) {
++            fc_group_delete_section(hwnd, group_hdr_copy);
++          }
++        }
++        else
++        {
++          // ── File list / background context menu ───────────────────────
++          int selidx=ListView_GetNextItem(list,-1,LVNI_SELECTED);
++          int selcnt=ListView_GetSelectedCount(list);
++          HMENU m=CreatePopupMenu(); int pos=0;
++          SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_NEWFOLDER,"New folder\tCtrl+Shift+N");
++          if (selidx>=0) {
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_SEPARATOR,0,"");
++            if (selcnt==1) SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_RENAME,"Rename\tF2");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_COPY,"Copy\tCtrl+C");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_CUT,"Cut\tCtrl+X");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_TRASH,"Move to Trash\tDel");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_SEPARATOR,0,"");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_COPYPATH,"Copy path\tCtrl+Shift+C");
++          }
++          if (s_fc_clip.paths.GetSize()>0) {
++            if (selidx<0) SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_SEPARATOR,0,"");
++            SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_PASTE,"Paste\tCtrl+V");
++          }
++          SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_SEPARATOR,0,"");
++          SWELL_InsertMenu(m,pos++,MF_BYPOSITION,ID_FC_OPENFILEMANAGER,"Open in file manager");
++          SWELL_InsertMenu(m,pos++,MF_BYPOSITION|MF_SEPARATOR,0,"");
++          SWELL_InsertMenu(m,pos++,MF_BYPOSITION|(parms->show_hidden?MF_CHECKED:MF_UNCHECKED),ID_SHOW_HIDDEN,"Show hidden files\tCtrl+H");
++          int cmd=TrackPopupMenu(m,TPM_RETURNCMD,p.x,p.y,0,hwnd,NULL);
++          DestroyMenu(m);
++          if (cmd) SendMessage(hwnd,WM_COMMAND,cmd,0);
++        }
+       }
+     return 1;
+   }

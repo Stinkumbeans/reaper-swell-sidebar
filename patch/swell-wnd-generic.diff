@@ -1,0 +1,52 @@
+--- /tmp/WDL/WDL/swell/swell-wnd-generic.cpp	2026-10-21 14:40:47.118134653 +0100
++++ /home/chimpanda/.local/share/reaper-libswell-patch/swell-wnd-generic.cpp	2026-10-21 00:57:40.786175884 +0100
+@@ -5661,14 +5661,14 @@
+       if (rect->right > rect->left)
+       {
+         int oc=0;
+-        if (item == m_sel) 
++        if (item == m_sel)
+         {
+           SetBkMode(hdc,OPAQUE);
+           SetBkColor(hdc,focus ? g_swell_ctheme.treeview_bg_sel : g_swell_ctheme.treeview_bg_sel_inactive);
+           oc = GetTextColor(hdc);
+           SetTextColor(hdc,focus ? g_swell_ctheme.treeview_text_sel : g_swell_ctheme.treeview_text_sel_inactive);
+         }
+-       
++
+         RECT dr = *rect;
+         const int sz = m_last_row_height/4;
+         if (item->m_haschildren)
+@@ -5694,7 +5694,7 @@
+         dr.left += sz*2+3;
+ 
+         DrawText(hdc,item->m_value ? item->m_value : "",-1,&dr,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+-        if (item == m_sel) 
++        if (item == m_sel)
+         {
+           SetBkMode(hdc,TRANSPARENT);
+           SetTextColor(hdc,oc);
+@@ -5840,6 +5840,23 @@
+         if (flag) return 0;
+       }
+     break;
++    case WM_RBUTTONDOWN:
++      if (tvs && tvs->m_last_row_height)
++      {
++        int y = GET_Y_LPARAM(lParam) + tvs->m_scroll_y + tvs->m_last_row_height;
++        int xo = -tvs->m_last_row_height;
++        HTREEITEM hit = tvs->hitTestItem(&tvs->m_root,&y,&xo);
++        if (hit && GET_X_LPARAM(lParam) >= xo && tvs->m_sel != hit)
++        {
++          tvs->m_sel = hit;
++          InvalidateRect(hwnd,NULL,FALSE);
++          NMTREEVIEW nm={{(HWND)hwnd,(UINT_PTR)hwnd->m_id,TVN_SELCHANGED},};
++          nm.itemNew.hItem = hit;
++          nm.itemNew.lParam = hit->m_param;
++          SendMessage(GetParent(hwnd),WM_NOTIFY,nm.hdr.idFrom,(LPARAM)&nm);
++        }
++      }
++    break;
+     case WM_LBUTTONDOWN:
+       SetFocus(hwnd);
+       SetCapture(hwnd);
