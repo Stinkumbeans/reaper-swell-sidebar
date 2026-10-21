@@ -10,7 +10,7 @@ Also adds full file operations to the dialog: new folder, rename, move to trash,
 
 Right-clicking a sidebar item lets you add/remove bookmarks, copy the path, or open in Dolphin.
 
-This patch affects the dialogs opened by **Insert Media**, **Save Project As**, **Browse** buttons in REAPER, and any other dialog that calls `BrowseForFiles`, `BrowseForSaveFile`, or `BrowseForDirectory`.
+This patch affects dialogs opened by **Save Project As**, **Browse** buttons, render output path, and anything else that calls `BrowseForFiles`, `BrowseForSaveFile`, or `BrowseForDirectory`. It does **not** affect the Insert Media dialog, which uses its own separate implementation.
 
 ---
 
