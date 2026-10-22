@@ -16,12 +16,14 @@ This patch affects dialogs opened by **Save Project As**, **Browse** buttons, re
 
 ## Install (pre-built)
 
-1. Find your REAPER install directory (commonly `~/opt/REAPER` or `/opt/REAPER`)
-2. Back up the original: `cp ~/opt/REAPER/libSwell.so ~/opt/REAPER/libSwell.so.bak`
-3. Copy the pre-built binary: `cp releases/libSwell.so ~/opt/REAPER/libSwell.so`
+1. Find your REAPER install directory — common locations:
+   - `~/opt/REAPER` — per-user install (note: `~/opt` means `/home/username/opt`, **not** `~/.opt`)
+   - `/opt/REAPER` — system-wide install
+2. Back up the original: `cp /path/to/REAPER/libSwell.so /path/to/REAPER/libSwell.so.bak`
+3. Copy the pre-built binary: `cp releases/libSwell.so /path/to/REAPER/libSwell.so`
 4. Restart REAPER
 
-> **Note:** The pre-built binary was built on Fedora with a CachyOS kernel. It should work on most modern Linux distros, but if REAPER crashes on launch, build from source instead.
+> **Note:** The pre-built binary was compiled on Fedora with a specific GTK3/glibc version. **It will likely not work on a different distro or even a different Fedora version.** If REAPER launches but the sidebar doesn't appear, or if REAPER crashes on launch, build from source — it only takes a minute with the script below.
 
 ---
 
